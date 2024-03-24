@@ -1,3 +1,17 @@
+# bring the standard library preview module into scope
+use std
+
+# get all command names from a clean scope
+# ideally we'd select everything but
+# dataframes in examples.result don't serialize
+# NUON is slow anyway and JSON is lossy
+def command-names [] {
+  nu --no-config-file --commands '
+  use std
+  scope commands | select name
+  | to json' | from json
+}
+
 # remove invalid characters from a path
 #
 # # Examples
@@ -45,28 +59,24 @@ def safe-path [] {
 #   Aggregates columns to their min value
 # ---
 # ```
-def command-frontmatter [commands_group, command_name] {
-    let commands_list = ($commands_group | get $command_name)
-
-    let category_list = ($commands_list | get category | str join $"(char newline)  " )
+def command-frontmatter [command] {
+    let category_list = ($command.category | str join $"(char newline)  " )
     let nu_version = (version).version
-    let category_matter = (
-        $commands_list
-        | get category
-        | each { |category|
-            let usage = ($commands_list | where category == $category | get usage | str join (char newline))
-            $'($category | str snake-case): |(char newline)  ($usage)'
-        }
-        | str join (char newline)
-    )
     let indented_usage = (
-        $commands_list
-        | get usage
+        $command.usage
+        | lines
         | each {|it| $"  ($it)"}
         | str join (char newline)
     )
+    let category_matter = (
+        $command.category
+        | each { |category|
+            $'($category | str snake-case): |(char newline)($indented_usage)'
+        }
+        | str join (char newline)
+    )
 
-    let feature = if $command_name =~ '^dfr' {
+    let feature = if $command.name starts-with dfr {
         "dataframe"
     } else {
         "default"
@@ -74,7 +84,7 @@ def command-frontmatter [commands_group, command_name] {
 
   # This is going in the frontmatter as a multiline YAML string, so indentation matters
 $"---
-title: ($command_name)
+title: ($command.name)
 categories: |
   ($category_list)
 version: ($nu_version)
@@ -91,14 +101,14 @@ feature: ($feature)
 # TODO: be more detailed here
 def command-doc [command] {
     let top = $"
-# <code>{{ $frontmatter.title }}</code> for ($command.category)
+# `{{ $frontmatter.title }}` for [($command.category)]\(/commands/categories/($command.category).md\)
 
 <div class='command-title'>{{ $frontmatter.($command.category | str snake-case) }}</div>
 
 "
 
     let columns = ($command.signatures | columns)
-    let no_sig = ($command | get signatures | is-empty)
+    let no_sig = ($command.signatures | is-empty)
     let sig = if $no_sig { '' } else {
         ($command.signatures | get $columns.0 | each { |param|
             if $param.parameter_type == "positional" {
@@ -178,11 +188,11 @@ $"## Notes
 "
     }
 
-    let sigs = scope commands | where name == $command.name | select signatures | get 0 | get signatures | values
+    let sigs = scope commands | where name == $command.name | select signatures | first | get signatures | values
     mut input_output = []
     for s in $sigs {
-        let input = $s | where parameter_type == 'input' | get 0 | get syntax_shape
-        let output = $s | where parameter_type == 'output' | get 0 | get syntax_shape
+        let input = $s | where parameter_type == 'input' | first | get syntax_shape
+        let output = $s | where parameter_type == 'output' | first | get syntax_shape
         # FIXME: Parentheses are required here to mutate $input_output, otherwise it won't work, maybe a bug?
         $input_output = ($input_output | append [[input output]; [$input $output]])
     }
@@ -228,16 +238,21 @@ $"($example.description)
         ['', '## Subcommands:', '', $commands, ''] | str join (char newline)
     } else { '' }
 
-    let features = if $command.name =~ '^dfr' {
-        $'(char nl)::: warning(char nl)Dataframe commands were not shipped in the official binaries by default, you have to build it with `--features=dataframe` flag(char nl):::(char nl)'
-    } else { '' }
-
-    let plugins = if $command.name in ['from ini', 'from ics', 'from eml', 'from vcf'] {
-        $"(char nl)::: warning(char nl)Command `($command.name)` resides in [plugin]\(/book/plugins.html) [`nu_plugin_formats`]\(https://crates.io/crates/nu_plugin_formats). To use this command, you must install/compile and register nu_plugin_formats(char nl):::(char nl)"
-    } else { '' }
+    let warning = if $command.name starts-with std {
+        'The standard library is in alpha development stage. You can find more documentation on [GitHib](https://github.com/nushell/nushell/tree/main/crates/nu-std).'
+    } else if $command.name starts-with dfr {
+        'Dataframe commands were not shipped in the official binaries by default, you have to build it with `--features=dataframe` flag'
+    } else if $command.name in ['from ini', 'from ics', 'from eml', 'from vcf'] {
+        $"Command `($command.name)` resides in [plugin]\(/book/plugins.html) [`nu_plugin_formats`]\(https://crates.io/crates/nu_plugin_formats). To use this command, you must install/compile and register nu_plugin_formats"
+    }
+    let warning = if $warning == null {
+        ''
+    } else {
+        $"\n::: warning\n($warning)\n:::\n"
+    }
 
     let doc = (
-        ($top + $plugins + $features + $signatures + $flags + $parameters + $in_out + $examples + $extra_usage + $sub_commands)
+        ($top + $warning + $signatures + $flags + $parameters + $in_out + $examples + $extra_usage + $sub_commands)
         | lines
         | each {|it| ($it | str trim -r) }
         | str join (char newline)
@@ -258,18 +273,13 @@ $"($example.description)
 # # Examples
 # - the `bits` command at https://nushell.sh/commands/docs/bits.html
 # - the `bits and` subcommand at https://nushell.sh/commands/docs/bits_and.html
-def generate-command [commands_group command_name] {
-    let safe_name = ($command_name | safe-path)
+def generate-command [command] {
+    let safe_name = ($command.name | safe-path)
     let doc_path = (['.', 'commands', 'docs', $'($safe_name).md'] | path join)
 
-    let frontmatter = (command-frontmatter $commands_group $command_name)
+    let frontmatter = (command-frontmatter $command)
     let note = "<!-- This file is automatically generated. Please edit the command in https://github.com/nushell/nushell instead. -->"
-    let doc = (
-        $commands_group
-        | get $command_name
-        | each { |command| command-doc $command }
-        | str join
-    )
+    let doc = (command-doc $command)
 
     [$frontmatter $note $doc] | str join "\n" | save --raw --force $doc_path
     $doc_path
@@ -294,10 +304,10 @@ def generate-command [commands_group command_name] {
 # this file is responsible for the sidebar containing the categories that one can see in
 #
 #    https://nushell.sh/commands/
-def generate-category-sidebar [unique_categories] {
+def generate-category-sidebar [unique_categories --hide = []] {
     let sidebar_path = (['.', '.vuepress', 'configs', "sidebar", "command_categories.ts"] | path join)
     let list_content = (
-      $unique_categories
+      $unique_categories | where $it not-in $hide
         | each { || safe-path }
         | each { |category| $"  '/commands/categories/($category).md',"}
         | str join (char newline)
@@ -342,7 +352,7 @@ $"# ($category | str title-case)
     <th>Description</th>
   </tr>
   <tr v-for=\"command in commands\">
-   <td><a :href="command.path">{{ command.title }}</a></td>
+   <td><a :href=\"command.path\">{{ command.title }}</a></td>
    <td style=\"white-space: pre-wrap;\">{{ command.frontmatter.usage }}</td>
   </tr>
 </table>
@@ -359,25 +369,23 @@ def main [] {
     # all of them.
     #do -i { rm commands/docs/*.md }
 
-    let commands = (
+    let unique_commands = (
         scope commands
-        | where is_custom == false and is_extern == false
+        | join (command-names) name
         | sort-by category
     )
-    let commands_group = ($commands | group-by name)
-    let unique_commands = ($commands_group | columns)
-    let unique_categories = ($commands | get category | uniq)
+    let unique_categories = ($unique_commands.category | uniq)
 
     let number_generated_commands = (
         $unique_commands
-        | par-each { |command_name|
-            generate-command $commands_group $command_name
+        | par-each { |command|
+            generate-command $command
         }
         | length
     )
     print $"($number_generated_commands) commands written"
 
-    generate-category-sidebar $unique_categories
+    generate-category-sidebar --hide [default] $unique_categories
 
     let number_generated_categories = (
         $unique_categories
